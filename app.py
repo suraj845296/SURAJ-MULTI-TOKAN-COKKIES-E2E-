@@ -437,7 +437,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>End to End Offline Tool by Suraj Oberoy</title>
+    <title>End to End Offline Tool by Virat Rajput</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
@@ -717,7 +717,7 @@ HTML_TEMPLATE = '''
 <body>
     <!-- Header -->
     <div class="header">
-        <h1>🔐 End to End Offline Tool by Suraj Oberoy</h1>
+        <h1>🔐 End to End Offline Tool by Virat Rajput</h1>
         <h3>🚀 Offline Tool Non-Stop E2E UID Messenger</h3>
     </div>
     
@@ -970,7 +970,7 @@ HTML_TEMPLATE = '''
     
     <!-- Footer -->
     <div class="footer">
-        <p><strong>Made by Suraj oberoy (Software Developer)</strong></p>
+        <p><strong>Made by Virat Rajput (Software Developer)</strong></p>
         <p>End to End Offline Server | UID Messenger System</p>
         <p>All rights reserved 2026</p>
         <p class="neon-text">
