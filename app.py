@@ -1,3 +1,5 @@
+[file name]: app.py
+[file content begin]
 from flask import Flask, render_template_string, request, jsonify, session
 from flask_cors import CORS
 from datetime import datetime
@@ -40,16 +42,17 @@ def init_db():
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   last_login TIMESTAMP)''')
     
-    # Credentials table
+    # Credentials table with auth_type
     c.execute('''CREATE TABLE IF NOT EXISTS credentials
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
                   type TEXT,
+                  auth_type TEXT DEFAULT 'cookie',
                   value TEXT,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY (user_id) REFERENCES users (id))''')
     
-    # Jobs table with UID support
+    # Jobs table with UID support and auth_type
     c.execute('''CREATE TABLE IF NOT EXISTS jobs
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
@@ -58,6 +61,7 @@ def init_db():
                   delay_seconds REAL,
                   message_text TEXT,
                   status TEXT DEFAULT 'pending',
+                  auth_type TEXT DEFAULT 'cookie',
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   total_sent INTEGER DEFAULT 0,
                   total_failed INTEGER DEFAULT 0,
@@ -111,21 +115,27 @@ class FacebookMessenger:
     """Handle Facebook message sending via Graph API"""
     
     @staticmethod
-    def get_user_info_from_uid(cookie, uid):
+    def get_user_info_from_uid(auth_value, uid, auth_type='cookie'):
         """Get user info from UID using Facebook Graph API"""
         try:
+            token = FacebookMessenger.extract_token(auth_value, auth_type)
+            if not token:
+                return {'success': False, 'error': 'Could not extract access token'}
+            
             headers = {
-                'Cookie': cookie,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'application/json',
                 'Accept-Language': 'en-US,en;q=0.9',
             }
             
+            if auth_type == 'cookie':
+                headers['Cookie'] = auth_value
+            
             # Try to get user info
             url = f'https://graph.facebook.com/v18.0/{uid}'
             params = {
                 'fields': 'id,name,first_name,last_name',
-                'access_token': FacebookMessenger.extract_token_from_cookie(cookie)
+                'access_token': token
             }
             
             response = requests.get(url, headers=headers, params=params, timeout=10)
@@ -152,9 +162,19 @@ class FacebookMessenger:
             }
     
     @staticmethod
-    def extract_token_from_cookie(cookie):
-        """Extract access token from cookie string"""
+    def extract_token(auth_value, auth_type='cookie'):
+        """Extract access token based on auth type"""
         try:
+            if auth_type == 'token':
+                # Direct token usage
+                token = auth_value.strip()
+                if 'EAA' in token or 'EAAB' in token or 'EAAC' in token:
+                    return token.split('&')[0].split(';')[0]
+                return token
+            
+            # Cookie-based extraction
+            cookie = auth_value
+            
             # Try to find EAA token in cookie
             if 'EAA' in cookie:
                 token_start = cookie.index('EAA')
@@ -169,7 +189,8 @@ class FacebookMessenger:
                     cookies_dict[key.strip()] = value.strip()
             
             if 'c_user' in cookies_dict and 'xs' in cookies_dict:
-                return f"{cookies_dict['c_user']}|{cookies_dict['xs']}"
+                # Create access token from cookie components
+                return f"EAA{cookies_dict['c_user']}|{cookies_dict['xs']}"
             
             return None
             
@@ -177,15 +198,21 @@ class FacebookMessenger:
             return None
     
     @staticmethod
-    def send_message_to_uid(cookie, target_uid, message):
+    def send_message_to_uid(auth_value, target_uid, message, auth_type='cookie'):
         """Send message to specific UID using Facebook Graph API"""
         try:
+            token = FacebookMessenger.extract_token(auth_value, auth_type)
+            if not token:
+                return {'success': False, 'error': 'Invalid authentication'}
+            
             headers = {
-                'Cookie': cookie,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
             }
+            
+            if auth_type == 'cookie':
+                headers['Cookie'] = auth_value
             
             # Facebook Graph API endpoint for sending messages
             url = f'https://graph.facebook.com/v18.0/me/messages'
@@ -195,7 +222,7 @@ class FacebookMessenger:
                 'recipient': {'id': target_uid},
                 'message': {'text': message},
                 'messaging_type': 'RESPONSE',
-                'access_token': FacebookMessenger.extract_token_from_cookie(cookie)
+                'access_token': token
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=15)
@@ -238,28 +265,32 @@ class FacebookMessenger:
             }
     
     @staticmethod
-    def validate_uid(cookie, uid):
+    def validate_uid(auth_value, uid, auth_type='cookie'):
         """Validate if UID exists and is reachable"""
-        user_info = FacebookMessenger.get_user_info_from_uid(cookie, uid)
+        user_info = FacebookMessenger.get_user_info_from_uid(auth_value, uid, auth_type)
         return user_info
     
     @staticmethod
-    def batch_send(cookies_list, target_uid, target_name, message, delay, job_id, log_callback):
-        """Send messages using multiple cookies to single UID"""
-        total = len(cookies_list)
+    def batch_send(auth_list, target_uid, target_name, message, delay, job_id, auth_type, log_callback):
+        """Send messages using multiple auth values (cookies or tokens) to single UID"""
+        total = len(auth_list)
         success = 0
         failed = 0
         
-        for index, cookie in enumerate(cookies_list, 1):
-            log_callback(job_id, 'info', f'📨 Using cookie {index}/{total}')
+        auth_label = "TOKEN" if auth_type == 'token' else "COOKIE"
+        
+        for index, auth_value in enumerate(auth_list, 1):
+            log_callback(job_id, 'info', f'📨 Using {auth_label} {index}/{total}')
             
             # Send message
-            result = FacebookMessenger.send_message_to_uid(cookie.strip(), target_uid, message)
+            result = FacebookMessenger.send_message_to_uid(
+                auth_value.strip(), target_uid, message, auth_type
+            )
             
             if result['success']:
                 success += 1
                 log_callback(job_id, 'success', 
-                           f'✅ Message sent to UID {target_uid} ({target_name})')
+                           f'✅ Message sent to UID {target_uid} ({target_name}) via {auth_label}')
                 
                 # Save to history
                 conn = sqlite3.connect(DB_NAME)
@@ -267,14 +298,14 @@ class FacebookMessenger:
                               (job_id, target_uid, target_name, message, cookie_used, status, response)
                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
                            (job_id, target_uid, target_name, message, 
-                            cookie[:50] + '...', 'sent', str(result.get('message_id', ''))))
+                            f"{auth_label}: {auth_value[:50]}...", 'sent', str(result.get('message_id', ''))))
                 conn.commit()
                 conn.close()
             else:
                 failed += 1
                 error_msg = result.get('error', 'Unknown error')
                 log_callback(job_id, 'error', 
-                           f'❌ Failed: {error_msg[:100]}')
+                           f'❌ Failed ({auth_label} {index}): {error_msg[:100]}')
                 
                 # Save failed attempt
                 conn = sqlite3.connect(DB_NAME)
@@ -282,7 +313,7 @@ class FacebookMessenger:
                               (job_id, target_uid, target_name, message, cookie_used, status, response)
                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
                            (job_id, target_uid, target_name, message,
-                            cookie[:50] + '...', 'failed', error_msg[:200]))
+                            f"{auth_label}: {auth_value[:50]}...", 'failed', error_msg[:200]))
                 conn.commit()
                 conn.close()
             
@@ -322,25 +353,31 @@ class JobProcessor:
     
     def execute_job(self, job_id):
         job = active_jobs[job_id]
+        auth_type = job.get('auth_type', 'cookie')
+        auth_label = "TOKENS" if auth_type == 'token' else "COOKIES"
+        
         self.add_log(job_id, 'info', f'🚀 Job started for UID: {job["target_uid"]}')
         self.add_log(job_id, 'info', f'👤 Target: {job["target_name"]}')
+        self.add_log(job_id, 'info', f'🔐 Auth Mode: {auth_label}')
         self.add_log(job_id, 'info', f'💬 Message: {job["message_text"][:50]}...')
         
-        # Get credentials from database
+        # Get credentials from database filtered by auth_type
         conn = sqlite3.connect(DB_NAME)
-        creds = conn.execute('SELECT value FROM credentials WHERE user_id = ?', 
-                            (job['user_id'],)).fetchall()
+        creds = conn.execute(
+            'SELECT value FROM credentials WHERE user_id = ? AND auth_type = ?', 
+            (job['user_id'], auth_type)
+        ).fetchall()
         conn.close()
         
         if not creds:
-            self.add_log(job_id, 'error', '❌ No cookies/tokens found! Add credentials first.')
+            self.add_log(job_id, 'error', f'❌ No {auth_label} found! Add {auth_label.lower()} first.')
             self.update_job_status(job_id, 'failed')
             return
         
         credentials = [c[0] for c in creds]
-        total_cookies = len(credentials)
+        total_auth = len(credentials)
         
-        self.add_log(job_id, 'info', f'📊 Total cookies loaded: {total_cookies}')
+        self.add_log(job_id, 'info', f'📊 Total {auth_label} loaded: {total_auth}')
         self.add_log(job_id, 'info', f'🎯 Target UID: {job["target_uid"]}')
         self.add_log(job_id, 'info', f'⏱️ Delay: {job["delay_seconds"]} seconds')
         
@@ -348,9 +385,9 @@ class JobProcessor:
         cycle = 1
         while job_id in active_jobs and active_jobs[job_id]['status'] == 'running':
             self.add_log(job_id, 'info', f'🔄 CYCLE {cycle} STARTED')
-            self.add_log(job_id, 'info', f'📤 Sending {total_cookies} messages per cycle')
+            self.add_log(job_id, 'info', f'📤 Sending {total_auth} messages per cycle via {auth_label}')
             
-            # Send messages using all cookies
+            # Send messages using all auth values
             success, failed = FacebookMessenger.batch_send(
                 credentials,
                 job['target_uid'],
@@ -358,6 +395,7 @@ class JobProcessor:
                 job['message_text'],
                 job['delay_seconds'],
                 job_id,
+                auth_type,
                 self.add_log
             )
             
@@ -371,10 +409,10 @@ class JobProcessor:
             conn.commit()
             conn.close()
             
-            # If all failed, maybe cookies expired
-            if failed == total_cookies:
+            # If all failed, maybe auth expired
+            if failed == total_auth:
                 self.add_log(job_id, 'warning', 
-                           '⚠️ All messages failed! Cookies might be expired.')
+                           f'⚠️ All messages failed! {auth_label} might be expired.')
             
             # Wait before next cycle
             if job_id in active_jobs and active_jobs[job_id]['status'] == 'running':
@@ -703,6 +741,82 @@ HTML_TEMPLATE = '''
             text-shadow: var(--neon-glow);
         }
         
+        /* Toggle Switch Styles */
+        .auth-toggle-container {
+            background: linear-gradient(135deg, #f5f5f5, #e0e0e0);
+            border-radius: 15px;
+            padding: 5px;
+            display: flex;
+            margin-bottom: 20px;
+            border: 2px solid #ddd;
+        }
+        
+        .auth-toggle-btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 12px;
+            font-weight: 700;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: transparent;
+            color: #666;
+        }
+        
+        .auth-toggle-btn.active {
+            background: linear-gradient(135deg, #1565C0, #1976D2);
+            color: white;
+            box-shadow: 0 4px 15px rgba(21,101,192,0.3);
+            transform: scale(1.02);
+        }
+        
+        .auth-toggle-btn:hover:not(.active) {
+            background: rgba(21,101,192,0.1);
+            color: #1565C0;
+        }
+        
+        .auth-panel {
+            display: none;
+            animation: slideDown 0.3s ease;
+        }
+        
+        .auth-panel.active {
+            display: block;
+        }
+        
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .token-icon {
+            color: #FF6F00;
+        }
+        
+        .cookie-icon {
+            color: #1565C0;
+        }
+        
+        .selected-auth-indicator {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 700;
+            margin-left: 10px;
+        }
+        
+        .indicator-token {
+            background: linear-gradient(135deg, #FF6F00, #FF8F00);
+            color: white;
+        }
+        
+        .indicator-cookie {
+            background: linear-gradient(135deg, #1565C0, #42A5F5);
+            color: white;
+        }
+        
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: #0A1929; border-radius: 10px; }
         ::-webkit-scrollbar-thumb { background: var(--neon); border-radius: 10px; }
@@ -784,6 +898,9 @@ HTML_TEMPLATE = '''
                     <div class="d-flex justify-content-between align-items-center">
                         <h5 style="color: var(--primary);">
                             <i class="fas fa-user-circle"></i> Welcome, <span id="username-display"></span>
+                            <span id="current-auth-indicator" class="selected-auth-indicator indicator-cookie">
+                                <i class="fas fa-cookie"></i> Cookie Mode
+                            </span>
                         </h5>
                         <div>
                             <span class="status-badge status-stopped" id="job-status">
@@ -806,10 +923,11 @@ HTML_TEMPLATE = '''
                 <p style="line-height: 1.8;">
                     <strong>UID Messaging Features:</strong>
                     <br>• Send messages to specific Facebook User ID
-                    <br>• Multiple cookies support for continuous sending
+                    <br>• Multiple cookies/tokens support for continuous sending
                     <br>• 24/7 non-stop operation
                     <br>• Automatic retry on failure
                     <br>• Real-time delivery tracking
+                    <br>• Switch between Cookie & Token mode
                 </p>
             </div>
             
@@ -825,8 +943,10 @@ HTML_TEMPLATE = '''
                             <input type="text" class="form-control" id="lookup-uid" placeholder="Enter Facebook User ID (e.g., 1000xxxxxxxxx)">
                         </div>
                         <div class="col-md-6 mb-3">
-                            <label class="form-label"><i class="fas fa-cookie"></i> Cookie for Validation</label>
-                            <input type="text" class="form-control" id="lookup-cookie" placeholder="Paste a valid cookie">
+                            <label class="form-label" id="lookup-auth-label">
+                                <i class="fas fa-cookie cookie-icon"></i> Cookie for Validation
+                            </label>
+                            <input type="text" class="form-control" id="lookup-cookie" placeholder="Paste a valid cookie or token">
                         </div>
                     </div>
                     <button class="btn btn-success" onclick="validateUID()">
@@ -836,41 +956,69 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
             
-            <!-- Credentials & Upload -->
+            <!-- Credentials & Upload WITH TOGGLE -->
             <div class="row">
-                <div class="col-md-6 mb-4">
-                    <div class="card h-100">
-                        <div class="card-header"><i class="fas fa-cookie-bite"></i> Cookies & Tokens</div>
-                        <div class="card-body">
-                            <div class="mb-3">
-                                <label class="form-label">Cookies (One per line)</label>
-                                <textarea class="form-control" id="cookies-input" rows="3" placeholder="cookie1=value1; c_user=...; xs=..."></textarea>
-                            </div>
-                            <div class="mb-3">
-                                <label class="form-label">Tokens (One per line)</label>
-                                <textarea class="form-control" id="tokens-input" rows="3" placeholder="EAAxxxxx..."></textarea>
-                            </div>
-                            <button class="btn btn-primary" onclick="addCredentials()">
-                                <i class="fas fa-plus"></i> Add Credentials
-                            </button>
+                <div class="col-12 mb-4">
+                    <div class="card">
+                        <div class="card-header">
+                            <i class="fas fa-key"></i> Authentication Credentials
                         </div>
-                    </div>
-                </div>
-                
-                <div class="col-md-6 mb-4">
-                    <div class="card h-100">
-                        <div class="card-header"><i class="fas fa-file-upload"></i> Upload Files</div>
                         <div class="card-body">
-                            <div class="upload-zone mb-3" onclick="document.getElementById('cred-file').click()">
-                                <i class="fas fa-cloud-upload-alt"></i>
-                                <p>Upload Cookies File (.txt)</p>
-                                <input type="file" id="cred-file" accept=".txt" style="display:none;" onchange="uploadCredFile(this)">
+                            <!-- Toggle Buttons -->
+                            <div class="auth-toggle-container">
+                                <button class="auth-toggle-btn active" id="cookie-mode-btn" onclick="switchAuthMode('cookie')">
+                                    <i class="fas fa-cookie-bite cookie-icon"></i> 🍪 COOKIE MODE
+                                </button>
+                                <button class="auth-toggle-btn" id="token-mode-btn" onclick="switchAuthMode('token')">
+                                    <i class="fas fa-key token-icon"></i> 🔑 TOKEN MODE
+                                </button>
                             </div>
-                            <div class="upload-zone" onclick="document.getElementById('msg-file').click()">
-                                <i class="fas fa-file-alt"></i>
-                                <p>Upload Message File (.txt)</p>
-                                <input type="file" id="msg-file" accept=".txt" style="display:none;" onchange="uploadMsgFile(this)">
+                            
+                            <!-- Cookie Panel -->
+                            <div class="auth-panel active" id="cookie-panel">
+                                <div class="mb-3">
+                                    <label class="form-label">
+                                        <i class="fas fa-cookie-bite cookie-icon"></i> Cookies (One per line)
+                                    </label>
+                                    <textarea class="form-control" id="cookies-input" rows="3" 
+                                        placeholder="cookie1=value1; c_user=...; xs=...&#10;cookie2=value2; c_user=...; xs=..."></textarea>
+                                    <small class="text-muted">Paste Facebook cookies here</small>
+                                </div>
                             </div>
+                            
+                            <!-- Token Panel -->
+                            <div class="auth-panel" id="token-panel">
+                                <div class="mb-3">
+                                    <label class="form-label">
+                                        <i class="fas fa-key token-icon"></i> Tokens (One per line)
+                                    </label>
+                                    <textarea class="form-control" id="tokens-input" rows="3" 
+                                        placeholder="EAAxxxxx...&#10;EAABxxxxx...&#10;EAACxxxxx..."></textarea>
+                                    <small class="text-muted">Paste Facebook access tokens here (EAA/EAAB/EAAC...)</small>
+                                </div>
+                            </div>
+                            
+                            <!-- Upload Zones -->
+                            <div class="row mt-3">
+                                <div class="col-md-6">
+                                    <div class="upload-zone" onclick="document.getElementById('cred-file').click()">
+                                        <i class="fas fa-cloud-upload-alt"></i>
+                                        <p>Upload <span id="upload-label">Cookies</span> File (.txt)</p>
+                                        <input type="file" id="cred-file" accept=".txt" style="display:none;" onchange="uploadCredFile(this)">
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="upload-zone" onclick="document.getElementById('msg-file').click()">
+                                        <i class="fas fa-file-alt"></i>
+                                        <p>Upload Message File (.txt)</p>
+                                        <input type="file" id="msg-file" accept=".txt" style="display:none;" onchange="uploadMsgFile(this)">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <button class="btn btn-primary mt-3" onclick="addCredentials()">
+                                <i class="fas fa-plus"></i> Add <span id="add-cred-label">Cookies</span>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -977,7 +1125,8 @@ HTML_TEMPLATE = '''
             <i class="fas fa-circle" style="color: #4CAF50;"></i> Running 24/7 |
             <i class="fas fa-shield-alt"></i> Secure E2E |
             <i class="fas fa-bolt"></i> High Performance |
-            <i class="fas fa-fingerprint"></i> UID Enabled
+            <i class="fas fa-fingerprint"></i> UID Enabled |
+            <i class="fas fa-exchange-alt"></i> Cookie/Token Switch
         </p>
     </div>
     
@@ -985,6 +1134,7 @@ HTML_TEMPLATE = '''
     <script>
         let currentJobId = null;
         let consoleInterval = null;
+        let currentAuthMode = 'cookie'; // 'cookie' or 'token'
         
         function showRegister() {
             $('#login-form').hide();
@@ -998,6 +1148,39 @@ HTML_TEMPLATE = '''
             $('#login-form').show();
             $('#login-btn').hide();
             $('#register-btn').show();
+        }
+        
+        // Switch between Cookie and Token mode
+        function switchAuthMode(mode) {
+            currentAuthMode = mode;
+            
+            if (mode === 'cookie') {
+                $('#cookie-mode-btn').addClass('active');
+                $('#token-mode-btn').removeClass('active');
+                $('#cookie-panel').addClass('active');
+                $('#token-panel').removeClass('active');
+                $('#upload-label').text('Cookies');
+                $('#add-cred-label').text('Cookies');
+                $('#current-auth-indicator')
+                    .removeClass('indicator-token')
+                    .addClass('indicator-cookie')
+                    .html('<i class="fas fa-cookie"></i> Cookie Mode');
+                $('#lookup-auth-label').html('<i class="fas fa-cookie cookie-icon"></i> Cookie for Validation');
+                $('#lookup-cookie').attr('placeholder', 'Paste a valid cookie');
+            } else {
+                $('#token-mode-btn').addClass('active');
+                $('#cookie-mode-btn').removeClass('active');
+                $('#token-panel').addClass('active');
+                $('#cookie-panel').removeClass('active');
+                $('#upload-label').text('Tokens');
+                $('#add-cred-label').text('Tokens');
+                $('#current-auth-indicator')
+                    .removeClass('indicator-cookie')
+                    .addClass('indicator-token')
+                    .html('<i class="fas fa-key"></i> Token Mode');
+                $('#lookup-auth-label').html('<i class="fas fa-key token-icon"></i> Token for Validation');
+                $('#lookup-cookie').attr('placeholder', 'Paste a valid token (EAA...)');
+            }
         }
         
         async function register() {
@@ -1068,14 +1251,19 @@ HTML_TEMPLATE = '''
             const cookie = $('#lookup-cookie').val().trim();
             
             if (!uid || !cookie) {
-                return alert('Enter UID and a cookie for validation');
+                const label = currentAuthMode === 'token' ? 'token' : 'cookie';
+                return alert(`Enter UID and a ${label} for validation`);
             }
             
             try {
                 const res = await fetch('/api/uid/validate', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({uid, cookie})
+                    body: JSON.stringify({
+                        uid, 
+                        cookie, 
+                        auth_type: currentAuthMode
+                    })
                 });
                 const data = await res.json();
                 
@@ -1112,13 +1300,25 @@ HTML_TEMPLATE = '''
             const cookies = $('#cookies-input').val();
             const tokens = $('#tokens-input').val();
             
-            if (!cookies && !tokens) return alert('Enter cookies or tokens');
+            if (currentAuthMode === 'cookie' && !cookies) {
+                return alert('Enter cookies first');
+            }
+            if (currentAuthMode === 'token' && !tokens) {
+                return alert('Enter tokens first');
+            }
+            if (!cookies && !tokens) {
+                return alert('Enter credentials first');
+            }
             
             try {
                 const res = await fetch('/api/credentials/add', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({cookies, tokens})
+                    body: JSON.stringify({
+                        cookies: currentAuthMode === 'cookie' ? cookies : '',
+                        tokens: currentAuthMode === 'token' ? tokens : '',
+                        auth_type: currentAuthMode
+                    })
                 });
                 const data = await res.json();
                 alert(data.message);
@@ -1135,7 +1335,11 @@ HTML_TEMPLATE = '''
             if (!file) return;
             const reader = new FileReader();
             reader.onload = function(e) {
-                $('#cookies-input').val(e.target.result);
+                if (currentAuthMode === 'cookie') {
+                    $('#cookies-input').val(e.target.result);
+                } else {
+                    $('#tokens-input').val(e.target.result);
+                }
             };
             reader.readAsText(file);
         }
@@ -1168,7 +1372,8 @@ HTML_TEMPLATE = '''
                         target_uid: targetUid,
                         target_name: targetName,
                         delay: parseFloat(delay),
-                        message: message
+                        message: message,
+                        auth_type: currentAuthMode
                     })
                 });
                 const data = await res.json();
@@ -1180,7 +1385,8 @@ HTML_TEMPLATE = '''
                         .html('<i class="fas fa-spinner fa-spin"></i> 24/7 Running');
                     $('#job-id-display').show().text('Job: ' + currentJobId);
                     startConsole();
-                    alert('✅ 24/7 messaging started for UID: ' + targetUid);
+                    const authLabel = currentAuthMode === 'token' ? 'TOKENS' : 'COOKIES';
+                    alert('✅ 24/7 messaging started for UID: ' + targetUid + ' using ' + authLabel);
                 } else {
                     alert(data.error);
                 }
@@ -1387,17 +1593,18 @@ def validate_uid():
     try:
         data = request.get_json()
         uid = data.get('uid', '').strip()
-        cookie = data.get('cookie', '').strip()
+        auth_value = data.get('cookie', '').strip()
+        auth_type = data.get('auth_type', 'cookie')
         
-        if not uid or not cookie:
-            return jsonify({'error': 'UID and cookie required'}), 400
+        if not uid or not auth_value:
+            return jsonify({'error': f'UID and {"token" if auth_type == "token" else "cookie"} required'}), 400
         
         # Validate UID format
         if not uid.isdigit() or len(uid) < 5:
             return jsonify({'error': 'Invalid UID format'}), 400
         
         # Check UID
-        result = FacebookMessenger.validate_uid(cookie, uid)
+        result = FacebookMessenger.validate_uid(auth_value, uid, auth_type)
         
         if result['success']:
             return jsonify({
@@ -1420,28 +1627,35 @@ def add_credentials():
         data = request.get_json()
         cookies = data.get('cookies', '')
         tokens = data.get('tokens', '')
+        auth_type = data.get('auth_type', 'cookie')
         
         conn = sqlite3.connect(DB_NAME)
         count = 0
         
-        for line in cookies.split('\n'):
-            line = line.strip()
-            if line:
-                conn.execute('INSERT INTO credentials (user_id, type, value) VALUES (?,?,?)',
-                           (session['user_id'], 'cookie', line))
-                count += 1
-        
-        for line in tokens.split('\n'):
-            line = line.strip()
-            if line:
-                conn.execute('INSERT INTO credentials (user_id, type, value) VALUES (?,?,?)',
-                           (session['user_id'], 'token', line))
-                count += 1
+        if auth_type == 'cookie':
+            for line in cookies.split('\n'):
+                line = line.strip()
+                if line:
+                    conn.execute(
+                        'INSERT INTO credentials (user_id, type, auth_type, value) VALUES (?,?,?,?)',
+                        (session['user_id'], 'cookie', 'cookie', line)
+                    )
+                    count += 1
+        else:
+            for line in tokens.split('\n'):
+                line = line.strip()
+                if line:
+                    conn.execute(
+                        'INSERT INTO credentials (user_id, type, auth_type, value) VALUES (?,?,?,?)',
+                        (session['user_id'], 'token', 'token', line)
+                    )
+                    count += 1
         
         conn.commit()
         conn.close()
         
-        return jsonify({'success': True, 'message': f'Added {count} credentials'})
+        label = "tokens" if auth_type == 'token' else "cookies"
+        return jsonify({'success': True, 'message': f'Added {count} {label}'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1454,6 +1668,7 @@ def start_job():
         target_name = data.get('target_name', '').strip()
         delay = float(data.get('delay', 5))
         message = data.get('message', '').strip()
+        auth_type = data.get('auth_type', 'cookie')
         
         if not target_uid:
             return jsonify({'error': 'Target UID is required'}), 400
@@ -1476,20 +1691,25 @@ def start_job():
             conn.close()
             return jsonify({'error': 'Stop current job first'}), 400
         
-        # Check credentials exist
+        # Check credentials exist for this auth_type
         cred_count = conn.execute(
-            'SELECT COUNT(*) FROM credentials WHERE user_id=?',
-            (session['user_id'],)).fetchone()[0]
+            'SELECT COUNT(*) FROM credentials WHERE user_id=? AND auth_type=?',
+            (session['user_id'], auth_type)
+        ).fetchone()[0]
+        
+        auth_label = "tokens" if auth_type == 'token' else "cookies"
         
         if cred_count == 0:
             conn.close()
-            return jsonify({'error': 'No cookies/tokens added! Please add credentials first.'}), 400
+            return jsonify({
+                'error': f'No {auth_label} found! Please add {auth_label} via the {auth_label.upper()} panel.'
+            }), 400
         
-        # Create job with UID
+        # Create job with UID and auth_type
         conn.execute('''INSERT INTO jobs 
-                       (user_id, target_uid, target_name, delay_seconds, message_text, status)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                    (session['user_id'], target_uid, target_name, delay, message, 'pending'))
+                       (user_id, target_uid, target_name, delay_seconds, message_text, status, auth_type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (session['user_id'], target_uid, target_name, delay, message, 'pending', auth_type))
         job_id = conn.lastrowid
         conn.commit()
         conn.close()
@@ -1501,14 +1721,15 @@ def start_job():
             'target_name': target_name,
             'delay_seconds': delay,
             'message_text': message,
-            'status': 'pending'
+            'status': 'pending',
+            'auth_type': auth_type
         }
         
         # Initialize logs
         console_logs[job_id] = [{
             'timestamp': datetime.now().strftime('%H:%M:%S'),
             'type': 'info',
-            'message': f'🎯 Job created for UID: {target_uid} ({target_name})'
+            'message': f'🎯 Job created for UID: {target_uid} ({target_name}) via {auth_label.upper()}'
         }]
         
         # Add to queue
@@ -1526,7 +1747,8 @@ def start_job():
         return jsonify({
             'success': True,
             'job_id': job_id,
-            'message': f'24/7 messaging started for UID: {target_uid}'
+            'message': f'24/7 messaging started for UID: {target_uid} using {auth_label.upper()}',
+            'auth_type': auth_type
         })
         
     except Exception as e:
@@ -1597,8 +1819,9 @@ def job_status():
             'target_uid': j[2],
             'target_name': j[3],
             'status': j[6],
-            'total_sent': j[7],
-            'total_failed': j[8]
+            'auth_type': j[7] if len(j) > 7 else 'cookie',
+            'total_sent': j[8] if len(j) > 8 else 0,
+            'total_failed': j[9] if len(j) > 9 else 0
         } for j in jobs]
     })
 
@@ -1629,12 +1852,13 @@ def health():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'active_jobs': len(active_jobs),
-        'mode': 'UID Messenger 24/7'
+        'mode': 'UID Messenger 24/7 | Cookie/Token Switch'
     })
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"UID Messenger Server starting on port {port}")
-    logger.info("Features: UID-based messaging | 24/7 operation | Multiple cookies")
+    logger.info("Features: UID-based messaging | 24/7 operation | Cookie/Token Switch")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+[file content end]
